@@ -3925,6 +3925,33 @@ def _short_expense_name(label: str) -> str:
     return base or label
 
 
+def _extract_month_year(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = re.search(r"\b(0[1-9]|1[0-2])\.(20\d{2})\b", text)
+    if not match:
+        return None
+    month, year = match.group(1), match.group(2)
+    return f"{year}-{month}"
+
+
+def _effective_expense_period(dtposted: str | None, purpose: str | None, category: str | None) -> str | None:
+    explicit = _extract_month_year(purpose)
+    if explicit:
+        return explicit
+    if not dtposted:
+        return None
+    try:
+        dt = pd.to_datetime(dtposted, errors="coerce")
+    except Exception:
+        return None
+    if pd.isna(dt):
+        return None
+    if category == "PDV":
+        dt = dt - pd.DateOffset(months=1)
+    return dt.strftime("%Y-%m")
+
+
 def _is_forex_expense(purpose: str | None, purposecode: str | None) -> bool:
     code = str(purposecode or "").strip()
     if code == "286":
@@ -3947,12 +3974,15 @@ def get_expense_summary(
     days: int | None = None,
     start: str | None = None,
     end: str | None = None,
+    year: str | None = None,
+    month: str | None = None,
 ) -> dict:
     date_clause, params = _date_filter_clause("dtposted", days, start, end)
     rows = conn.execute(
         "SELECT dtposted, amount, purpose, purposecode, payee_name "
         "FROM bank_transactions "
-        "WHERE benefit = 'debit' AND dtposted IS NOT NULL " + date_clause,
+        "WHERE benefit = 'debit' AND dtposted IS NOT NULL "
+        + date_clause,
         params,
     ).fetchall()
     total = 0.0
@@ -3969,11 +3999,15 @@ def get_expense_summary(
             continue
         label = _expense_category(payee_name, purpose)
         key = _normalize_expense_key(label)
+        period = _effective_expense_period(dtposted, purpose, label)
+        if year and (not period or not period.startswith(year)):
+            continue
+        if month and (not period or len(period) < 7 or period[5:7] != month):
+            continue
         totals[key] = totals.get(key, 0.0) + final_amount
         if key not in display_names:
             display_names[key] = label
         total += final_amount
-        period = str(dtposted or "")[:7]
         if period:
             if period not in monthly:
                 monthly[period] = {}
@@ -4555,6 +4589,8 @@ def run_ui(db_path: Path) -> None:
         "expense_period_days": None,
         "expense_period_start": None,
         "expense_period_end": None,
+        "expense_year": None,
+        "expense_month": None,
         "expense_top_n": 5,
     }
     btn_reset_matches = None
@@ -4832,10 +4868,31 @@ def run_ui(db_path: Path) -> None:
 
     def refresh_expenses():
         conn = get_conn()
+        years = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT substr(dtposted, 1, 4) "
+                "FROM bank_transactions "
+                "WHERE dtposted IS NOT NULL "
+                "ORDER BY substr(dtposted, 1, 4)"
+            ).fetchall()
+            if row[0]
+        ]
+        if years:
+            expense_year_menu.configure(values=["Sve"] + years)
+            if expense_year_var.get() not in (["Sve"] + years):
+                expense_year_var.set("Sve")
+                state["expense_year"] = None
         period_days = state.get("expense_period_days")
         start = state.get("expense_period_start")
         end = state.get("expense_period_end")
-        summary = get_expense_summary(conn, period_days, start, end)
+        year = state.get("expense_year")
+        month = state.get("expense_month")
+        if year or month:
+            period_days = None
+            start = None
+            end = None
+        summary = get_expense_summary(conn, period_days, start, end, year, month)
         conn.close()
 
         total = summary["total"] or 0.0
@@ -4852,6 +4909,7 @@ def run_ui(db_path: Path) -> None:
             values = [chart_value(v) for _, v in top_items]
             max_val = max(values) if values else 0
             labels = []
+            full_labels = []
             for key, val in top_items:
                 name = display.get(key, key)
                 share = (val / total * 100.0) if total else 0.0
@@ -4863,20 +4921,47 @@ def run_ui(db_path: Path) -> None:
                     ratio,
                 )
                 labels.append(label)
+                full_labels.append(f"{name}\nUdio: {share:.1f}% | {format_amount(val)}")
             labels_rev = labels[::-1]
+            full_labels_rev = full_labels[::-1]
             values_rev = values[::-1]
             y_pos = list(range(len(labels_rev)))
             bars = ax_expenses_top.barh(y_pos, values_rev, color="#f28e2c")
             ax_expenses_top.set_title(f"Top {len(top_items)} troskova ({chart_currency_label()})")
             ax_expenses_top.tick_params(axis="y", left=False, labelleft=False)
+            outside_labels = []
+            outside_positions = []
+            inside_labels = []
+            for bar, label, full_label in zip(bars, labels_rev, full_labels_rev):
+                width = bar.get_width()
+                ratio = (width / max_val) if max_val else 0
+                if ratio < 0.22:
+                    outside_labels.append(full_label)
+                    outside_positions.append(bar)
+                    inside_labels.append("")
+                else:
+                    inside_labels.append(label)
             ax_expenses_top.bar_label(
                 bars,
-                labels=labels_rev,
+                labels=inside_labels,
                 label_type="center",
                 padding=0,
                 color="white",
                 fontsize=8,
             )
+            if outside_positions:
+                offset = max_val * 0.02 if max_val else 0.1
+                for bar, label in zip(outside_positions, outside_labels):
+                    ax_expenses_top.text(
+                        bar.get_width() + offset,
+                        bar.get_y() + bar.get_height() / 2,
+                        label,
+                        va="center",
+                        ha="left",
+                        fontsize=8,
+                        color="black",
+                    )
+                ax_expenses_top.set_xlim(0, max_val * 1.25 if max_val else 1)
         else:
             ax_expenses_top.set_title("Top troskovi (nema podataka)")
         canvas_expenses_top.draw()
@@ -6415,6 +6500,38 @@ def run_ui(db_path: Path) -> None:
         command=on_expense_period_change,
     )
     expense_period_menu.pack(side="left", padx=4)
+
+    ctk.CTkLabel(expenses_header, text="Godina:").pack(side="left", padx=(12, 4))
+    expense_year_var = ctk.StringVar(value="Sve")
+
+    def on_expense_year_change(choice: str):
+        state["expense_year"] = None if choice == "Sve" else choice
+        refresh_expenses()
+
+    expense_year_menu = ctk.CTkOptionMenu(
+        expenses_header,
+        values=["Sve"],
+        variable=expense_year_var,
+        command=on_expense_year_change,
+        width=90,
+    )
+    expense_year_menu.pack(side="left", padx=4)
+
+    ctk.CTkLabel(expenses_header, text="Mjesec:").pack(side="left", padx=(12, 4))
+    expense_month_var = ctk.StringVar(value="Sve")
+
+    def on_expense_month_change(choice: str):
+        state["expense_month"] = None if choice == "Sve" else choice
+        refresh_expenses()
+
+    expense_month_menu = ctk.CTkOptionMenu(
+        expenses_header,
+        values=["Sve"] + [f"{i:02d}" for i in range(1, 13)],
+        variable=expense_month_var,
+        command=on_expense_month_change,
+        width=70,
+    )
+    expense_month_menu.pack(side="left", padx=4)
 
     ctk.CTkLabel(expenses_header, text="Top:").pack(side="left", padx=(12, 4))
     expense_top_var = ctk.StringVar(value="5")
