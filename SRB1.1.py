@@ -3878,11 +3878,11 @@ def get_sp_bank_monthly(conn: sqlite3.Connection, days: int | None = None, start
         "SUM(CASE WHEN benefit = 'debit' "
         "AND lower(COALESCE(purpose, '')) NOT LIKE '%kupoprodaja deviza%' "
         "AND COALESCE(purposecode, '') != '286' "
-        "AND lower(COALESCE(purpose, '')) NOT LIKE '%carine i druge uvozne dazbine%' "
+        "AND lower(COALESCE(purpose, '')) NOT LIKE '%carin%' "
         "THEN amount ELSE 0 END) "
         "+ SUM(CASE WHEN benefit = 'debit' "
-        "AND lower(COALESCE(purpose, '')) LIKE '%carine i druge uvozne dazbine%' "
-        "THEN amount * 0.05 ELSE 0 END)"
+        "AND lower(COALESCE(purpose, '')) LIKE '%carin%' "
+        "THEN amount * 0.20 ELSE 0 END)"
         ") AS expense "
         "FROM bank_transactions "
         "WHERE dtposted IS NOT NULL " + date_clause +
@@ -3898,11 +3898,31 @@ def _normalize_expense_key(text: str) -> str:
     return value or "nepoznato"
 
 
-def _expense_label(payee_name: str | None, purpose: str | None) -> str:
+def _expense_category(payee_name: str | None, purpose: str | None) -> str:
+    text = normalize_text_loose(" ".join([str(payee_name or ""), str(purpose or "")]))
+    if "slanje paketa" in text:
+        return "Slanje Paketa"
+    if (
+        "svrha doprinosi" in text
+        or "uplata poreza i doprinosa po odbitku" in text
+        or "doprinosi" in text
+    ):
+        return "Doprinosi za socijalno osiguranje"
+    if "840-0000714112843-10" in text:
+        return "PDV"
+    if "placanje pdv" in text or "plaćanje pdv" in text:
+        return "PDV"
     label = (payee_name or "").strip()
     if not label:
         label = (purpose or "").strip()
     return label or "Nepoznato"
+
+
+def _short_expense_name(label: str) -> str:
+    if not label:
+        return "Nepoznato"
+    base = label.split(",")[0].strip()
+    return base or label
 
 
 def _is_forex_expense(purpose: str | None, purposecode: str | None) -> bool:
@@ -3917,8 +3937,8 @@ def _expense_amount(purpose: str | None, purposecode: str | None, amount: float)
     if _is_forex_expense(purpose, purposecode):
         return None
     text = normalize_text_loose(purpose)
-    if "carine i druge uvozne dazbine" in text:
-        return amount * 0.05
+    if "carin" in text:
+        return amount * 0.20
     return amount
 
 
@@ -3947,7 +3967,7 @@ def get_expense_summary(
         final_amount = _expense_amount(purpose, purposecode, amt)
         if final_amount is None:
             continue
-        label = _expense_label(payee_name, purpose)
+        label = _expense_category(payee_name, purpose)
         key = _normalize_expense_key(label)
         totals[key] = totals.get(key, 0.0) + final_amount
         if key not in display_names:
@@ -4736,14 +4756,38 @@ def run_ui(db_path: Path) -> None:
             bars = ax_customers.barh(y_pos, values_rev, color="#5aa9e6")
             ax_customers.set_title(f"Top 5 kupaca ({chart_currency_label()})")
             ax_customers.tick_params(axis="y", left=False, labelleft=False)
+            outside_labels = []
+            outside_positions = []
+            inside_labels = []
+            for bar, label in zip(bars, labels_rev):
+                width = bar.get_width()
+                ratio = (width / max_val) if max_val else 0
+                if ratio < 0.22:
+                    outside_labels.append(label)
+                    outside_positions.append(bar)
+                    inside_labels.append("")
+                else:
+                    inside_labels.append(label)
             ax_customers.bar_label(
                 bars,
-                labels=labels_rev,
+                labels=inside_labels,
                 label_type="center",
                 padding=0,
                 color="white",
                 fontsize=8,
             )
+            if outside_positions:
+                offset = max_val * 0.02 if max_val else 0.1
+                for bar, label in zip(outside_positions, outside_labels):
+                    ax_customers.text(
+                        bar.get_width() + offset,
+                        bar.get_y() + bar.get_height() / 2,
+                        label,
+                        va="center",
+                        ha="left",
+                        fontsize=8,
+                        color="black",
+                    )
         else:
             ax_customers.set_title("Top 5 kupaca (nema podataka)")
         canvas_customers.draw()
@@ -4844,7 +4888,11 @@ def run_ui(db_path: Path) -> None:
             bottoms = [0.0 for _ in months]
             for key in top_keys:
                 series = [chart_value(monthly.get(m, {}).get(key, 0.0)) for m in months]
-                ax_expenses_month.bar(months, series, bottom=bottoms, label=display.get(key, key))
+                total_val = totals.get(key, 0.0)
+                share = (total_val / total * 100.0) if total else 0.0
+                name = _short_expense_name(display.get(key, key))
+                label = f"{name} | {format_amount(total_val)} | {share:.1f}%"
+                ax_expenses_month.bar(months, series, bottom=bottoms, label=label)
                 bottoms = [b + s for b, s in zip(bottoms, series)]
             ax_expenses_month.set_title(f"Troskovi po mjesecu (Top {len(top_items)})")
             ax_expenses_month.tick_params(axis="x", rotation=35)
