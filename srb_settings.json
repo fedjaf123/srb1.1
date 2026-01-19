@@ -1,3 +1,5 @@
 {
-  "db_path": "C:/Users/HOME/Desktop/Srbija1.0 aplikacija/SRB1.0 - Copy.db"
+  "db_path": "C:/Users/HOME/Desktop/Srbija1.0 aplikacija/SRB1.0 - Copy.db",
+  "kalkulacije_output_dir": "C:\\Users\\HOME\\Desktop\\Srbija1.0 aplikacija\\Kalkulacije i kartice artikala",
+  "kartice_output_dir": "C:\\Users\\HOME\\Desktop\\Srbija1.0 aplikacija\\Kalkulacije i kartice artikala"
 }

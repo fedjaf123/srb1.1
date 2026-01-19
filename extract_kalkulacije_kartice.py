@@ -443,6 +443,11 @@ def main() -> int:
         help="Skip PDF parsing for kartice",
     )
     parser.add_argument(
+        "--skip-excel",
+        action="store_true",
+        help="Skip Excel parsing for kalkulacije",
+    )
+    parser.add_argument(
         "--sales",
         type=Path,
         default=Path(
@@ -459,9 +464,12 @@ def main() -> int:
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
-    detail_path, agg_path = extract_kalkulacije(args.excel, args.out)
-    print(f"kalkulacije: {detail_path}")
-    print(f"kalkulacije agregat: {agg_path}")
+    detail_path = args.out / "kalkulacije_marza.csv"
+    agg_path = args.out / "kalkulacije_marza_agregat.csv"
+    if not args.skip_excel:
+        detail_path, agg_path = extract_kalkulacije(args.excel, args.out)
+        print(f"kalkulacije: {detail_path}")
+        print(f"kalkulacije agregat: {agg_path}")
 
     if not args.skip_pdf:
         zero_path = extract_zero_intervals(args.pdf, args.out)

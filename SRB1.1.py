@@ -1,11 +1,14 @@
 ﻿import argparse
 import csv
 import hashlib
+import math
 import statistics
 import json
 import re
 import sqlite3
 import shutil
+import subprocess
+import sys
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
@@ -15,6 +18,26 @@ import pandas as pd
 
 
 DB_PATH = Path(__file__).with_suffix(".db")
+
+EXTRACT_SCRIPT = Path(__file__).with_name("extract_kalkulacije_kartice.py")
+
+KALKULACIJE_DIR = Path("Kalkulacije_kartice_art")
+KALKULACIJE_OUT_DIR = KALKULACIJE_DIR / "izlaz"
+ZERO_INTERVAL_CSV = KALKULACIJE_OUT_DIR / "kartice_zero_intervali.csv"
+KALKULACIJE_AGG_CSV = KALKULACIJE_OUT_DIR / "kalkulacije_marza_agregat.csv"
+KALKULACIJE_DETAIL_CSV = KALKULACIJE_OUT_DIR / "kalkulacije_marza.csv"
+PRODAJA_STATS_CSV = KALKULACIJE_OUT_DIR / "prodaja_avg_i_gubitak.csv"
+
+ZERO_SOURCE = "kartice_zero_intervals"
+KALKULACIJE_SOURCE = "kartice_kalkulacije"
+KALKULACIJE_DETAIL_SOURCE = "kartice_kalkulacije_detail"
+PRODAJA_SOURCE = "kartice_prodaja_stats"
+SOURCE_LABELS = {
+    ZERO_SOURCE: "Zero intervali",
+    KALKULACIJE_SOURCE: "Kalkulacije",
+    KALKULACIJE_DETAIL_SOURCE: "Detalji kalkulacija",
+    PRODAJA_SOURCE: "Prodaja",
+}
 
 SHEET_SP_ORDERS = "Porud\u017ebine"
 SHEET_SP_PAYMENTS = "Knji\u017eenje kupaca"
@@ -552,28 +575,122 @@ CREATE TABLE IF NOT EXISTS tracking_events (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tracking_events_unique
   ON tracking_events(tracking_code, status_time, status_value);
 
-CREATE TABLE IF NOT EXISTS tracking_summary (
-  tracking_code TEXT PRIMARY KEY,
-  received_at TEXT,
-  first_out_for_delivery_at TEXT,
-  delivery_attempts INTEGER,
-  failure_reasons TEXT,
-  returned_at TEXT,
-  days_to_first_attempt REAL,
-  has_attempt_before_return INTEGER,
-  has_returned INTEGER,
-  anomalies TEXT,
-  last_status TEXT,
-  last_status_at TEXT,
-  last_fetched_at TEXT NOT NULL
-);
+  CREATE TABLE IF NOT EXISTS tracking_summary (
+    tracking_code TEXT PRIMARY KEY,
+    received_at TEXT,
+    first_out_for_delivery_at TEXT,
+    delivery_attempts INTEGER,
+    failure_reasons TEXT,
+    returned_at TEXT,
+    days_to_first_attempt REAL,
+    has_attempt_before_return INTEGER,
+    has_returned INTEGER,
+    anomalies TEXT,
+    last_status TEXT,
+    last_status_at TEXT,
+    last_fetched_at TEXT NOT NULL
+  );
+  
+  CREATE TABLE IF NOT EXISTS task_progress (
+    task TEXT PRIMARY KEY,
+    total INTEGER NOT NULL,
+    processed INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 
-CREATE TABLE IF NOT EXISTS task_progress (
-  task TEXT PRIMARY KEY,
-  total INTEGER NOT NULL,
-  processed INTEGER NOT NULL,
-  updated_at TEXT NOT NULL
-);
+  CREATE TABLE IF NOT EXISTS cartice_zero_intervals (
+    id INTEGER PRIMARY KEY,
+    sku TEXT NOT NULL,
+    artikal TEXT,
+    zero_from TEXT NOT NULL,
+    zero_to TEXT,
+    days_without INTEGER,
+    document_start TEXT,
+    document_end TEXT,
+    import_run_id INTEGER,
+    FOREIGN KEY(import_run_id) REFERENCES import_runs(id),
+    UNIQUE(sku, zero_from, document_start)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cartice_zero_sku
+    ON cartice_zero_intervals(sku);
+
+  CREATE TABLE IF NOT EXISTS cartice_zero_meta (
+    sku TEXT PRIMARY KEY,
+    last_zero_to TEXT,
+    last_document TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS cartice_receipts (
+    id INTEGER PRIMARY KEY,
+    sku TEXT NOT NULL,
+    document TEXT NOT NULL,
+    quantity REAL,
+    updated_at TEXT,
+    UNIQUE(sku, document)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cartice_receipts
+    ON cartice_receipts(sku, document);
+
+  CREATE TABLE IF NOT EXISTS cartice_kalkulacije (
+    id INTEGER PRIMARY KEY,
+    sku TEXT NOT NULL,
+    artikal TEXT,
+    kolicina_sum REAL,
+    nabavna_sum REAL,
+    prodajna_sum REAL,
+    marza_sum REAL,
+    doc_count INTEGER,
+    first_date TEXT,
+    last_date TEXT,
+    import_run_id INTEGER,
+    FOREIGN KEY(import_run_id) REFERENCES import_runs(id),
+    UNIQUE(sku)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cartice_kalkulacije_sku
+    ON cartice_kalkulacije(sku);
+
+  CREATE TABLE IF NOT EXISTS cartice_kalkulacije_detail (
+    id INTEGER PRIMARY KEY,
+    opis TEXT NOT NULL UNIQUE,
+    sku TEXT,
+    artikal TEXT,
+    datum TEXT,
+    broj TEXT,
+    kolicina REAL,
+    imported_at TEXT NOT NULL,
+    import_run_id INTEGER,
+    FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cartice_kalkulacije_detail_opis
+    ON cartice_kalkulacije_detail(opis);
+
+  CREATE TABLE IF NOT EXISTS prodaja_stats (
+    id INTEGER PRIMARY KEY,
+    sku TEXT NOT NULL,
+    artikal TEXT,
+    total_sold REAL,
+    first_date TEXT,
+    last_date TEXT,
+    total_days INTEGER,
+    days_without INTEGER,
+    days_available INTEGER,
+    avg_daily REAL,
+    total_net REAL,
+    avg_net REAL,
+    lost_net REAL,
+    lost_qty REAL,
+    imported_at TEXT,
+    import_run_id INTEGER,
+    FOREIGN KEY(import_run_id) REFERENCES import_runs(id),
+    UNIQUE(sku)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_prodaja_stats_sku
+    ON prodaja_stats(sku);
 """
 
 
@@ -606,6 +723,352 @@ def file_hash(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return [row for row in reader]
+
+
+def _normalize_numeric_literal(text: str) -> str:
+    value = text.replace(" ", "")
+    if "," in value and "." in value:
+        value = value.replace(".", "").replace(",", ".")
+    elif "," in value:
+        value = value.replace(",", ".")
+    return value
+
+
+def _parse_float(value: str | None, default: float | None = 0.0) -> float | None:
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        normalized = _normalize_numeric_literal(text)
+        return float(normalized)
+    except ValueError:
+        return default
+
+
+def _parse_int(value: str | None, default: int | None = 0) -> int | None:
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text:
+        return default
+    float_val = _parse_float(text, default=None)
+    if float_val is None:
+        return default
+    try:
+        return int(float_val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _record_import_run(
+    conn: sqlite3.Connection,
+    source: str,
+    path: Path,
+    file_hash_value: str,
+    row_count: int,
+) -> int | None:
+    try:
+        cur = conn.execute(
+            "INSERT INTO import_runs (source, filename, file_hash, imported_at, row_count) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                source,
+                str(path),
+                file_hash_value,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                row_count,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        return None
+    return cur.lastrowid
+
+
+def _run_cartice_import(
+    conn: sqlite3.Connection,
+    path: Path,
+    source: str,
+    apply_fn,
+) -> dict[str, str | int]:
+    if not path.exists():
+        return {"source": source, "status": "missing", "path": str(path)}
+    digest = file_hash(path)
+    existing = conn.execute(
+        "SELECT id FROM import_runs WHERE source = ? AND file_hash = ?",
+        (source, digest),
+    ).fetchone()
+    if existing:
+        return {"source": source, "status": "skipped"}
+    rows = _read_csv_rows(path)
+    import_id = _record_import_run(conn, source, path, digest, len(rows))
+    if import_id is None:
+        return {"source": source, "status": "skipped"}
+    inserted = apply_fn(conn, rows, import_id)
+    conn.commit()
+    return {"source": source, "status": "imported", "rows": inserted}
+
+
+def _doc_order_key(doc: str | None) -> tuple[int, ...]:
+    if not doc:
+        return ()
+    digits = [int(value) for value in re.findall(r"\\d+", doc) if value.isdigit()]
+    return tuple(digits)
+
+
+def _load_zero_meta(conn: sqlite3.Connection) -> dict[str, tuple[str | None, str | None]]:
+    rows = conn.execute(
+        "SELECT sku, last_zero_to, last_document FROM cartice_zero_meta"
+    ).fetchall()
+    return {sku: (last_zero_to, last_document) for sku, last_zero_to, last_document in rows}
+
+
+def _load_receipts(conn: sqlite3.Connection) -> dict[tuple[str, str], float | None]:
+    rows = conn.execute("SELECT sku, document, quantity FROM cartice_receipts").fetchall()
+    result: dict[tuple[str, str], float | None] = {}
+    for sku, document, quantity in rows:
+        if not document:
+            continue
+        result[(sku, document)] = float(quantity) if quantity is not None else None
+    return result
+
+
+def _receipt_quantity_from_detail(conn: sqlite3.Connection, sku: str, document: str) -> float | None:
+    row = conn.execute(
+        "SELECT SUM(kolicina) FROM cartice_kalkulacije_detail WHERE sku = ? AND broj = ?",
+        (sku, document),
+    ).fetchone()
+    value = row[0] if row else None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _update_receipt_record(
+    conn: sqlite3.Connection, sku: str, document: str, quantity: float | None
+) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT INTO cartice_receipts (sku, document, quantity, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(sku, document) DO UPDATE SET "
+        "quantity = excluded.quantity, updated_at = excluded.updated_at",
+        (sku, document, quantity, now),
+    )
+
+
+def _should_insert_zero_interval(
+    meta_entry: tuple[str | None, str | None] | None,
+    candidate_date: date | None,
+    candidate_doc_key: tuple[int, ...],
+) -> bool:
+    if meta_entry is None:
+        return True
+    meta_date_str, meta_doc = meta_entry
+    meta_date = normalize_date(meta_date_str) if meta_date_str else None
+    meta_doc_key = _doc_order_key(meta_doc)
+    if candidate_date and meta_date:
+        if candidate_date < meta_date:
+            return False
+        if candidate_date > meta_date:
+            return True
+        return candidate_doc_key > meta_doc_key
+    if candidate_date and not meta_date:
+        return True
+    if not candidate_date and meta_date:
+        return candidate_doc_key > meta_doc_key
+    return candidate_doc_key > meta_doc_key
+
+
+def _apply_zero_intervals(conn: sqlite3.Connection, rows: list[dict[str, str]], import_run_id: int) -> int:
+    cursor = conn.cursor()
+    meta_map = _load_zero_meta(conn)
+    receipt_map = _load_receipts(conn)
+    insert_sql = (
+        "INSERT OR IGNORE INTO cartice_zero_intervals "
+        "(sku, artikal, zero_from, zero_to, days_without, document_start, document_end, import_run_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    inserted = 0
+    meta_updates: dict[str, tuple[date | None, str | None]] = {}
+    for row in rows:
+        sku = (row.get("SKU") or "").strip()
+        zero_from = (row.get("Zero od") or "").strip()
+        zero_to_raw = (row.get("Zero do") or "").strip()
+        zero_to = normalize_date(zero_to_raw) if zero_to_raw else None
+        if not sku or not zero_from:
+            continue
+        candidate_date = zero_to or normalize_date(zero_from)
+        doc_end = (row.get("Dokument kraj") or "").strip()
+        doc_key = _doc_order_key(doc_end)
+        if not _should_insert_zero_interval(meta_map.get(sku), candidate_date, doc_key):
+            continue
+        receipt_qty = None
+        if doc_end:
+            existing_qty = receipt_map.get((sku, doc_end))
+            receipt_qty = _receipt_quantity_from_detail(conn, sku, doc_end)
+            skip_due_to_doc = (
+                existing_qty is not None
+                and (receipt_qty is None or math.isclose(existing_qty, receipt_qty, rel_tol=1e-6))
+            )
+            if skip_due_to_doc:
+                continue
+        values = (
+            sku,
+            (row.get("Artikal") or "").strip(),
+            zero_from,
+            zero_to_raw or None,
+            _parse_int(row.get("Dani bez zalihe"), default=None),
+            (row.get("Dokument start") or "").strip(),
+            doc_end,
+            import_run_id,
+        )
+        cursor.execute(insert_sql, values)
+        if cursor.rowcount:
+            inserted += 1
+            meta_updates[sku] = (candidate_date, doc_end)
+            meta_map[sku] = (
+                candidate_date.strftime("%Y-%m-%d") if candidate_date else None,
+                doc_end,
+            )
+            if doc_end:
+                _update_receipt_record(conn, sku, doc_end, receipt_qty)
+                receipt_map[(sku, doc_end)] = receipt_qty
+    for sku, (date_obj, doc_text) in meta_updates.items():
+        date_text = date_obj.strftime("%Y-%m-%d") if date_obj else None
+        conn.execute(
+            "INSERT INTO cartice_zero_meta (sku, last_zero_to, last_document) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(sku) DO UPDATE SET last_zero_to = excluded.last_zero_to, "
+            "last_document = excluded.last_document",
+            (sku, date_text, doc_text),
+        )
+    return inserted
+
+
+def _apply_kalkulacije(conn: sqlite3.Connection, rows: list[dict[str, str]], import_run_id: int) -> int:
+    conn.execute("DELETE FROM cartice_kalkulacije")
+    parsed = []
+    for row in rows:
+        sku = (row.get("SKU") or "").strip()
+        if not sku:
+            continue
+        parsed.append(
+            (
+                sku,
+                (row.get("Artikal") or "").strip(),
+                _parse_float(row.get("kolicina_sum")) or 0.0,
+                _parse_float(row.get("nabavna_sum")) or 0.0,
+                _parse_float(row.get("prodajna_sum")) or 0.0,
+                _parse_float(row.get("marza_sum")) or 0.0,
+                _parse_int(row.get("doc_count")) or 0,
+                (row.get("first_date") or "").strip(),
+                (row.get("last_date") or "").strip(),
+                import_run_id,
+            )
+        )
+    if parsed:
+        conn.executemany(
+            "INSERT INTO cartice_kalkulacije "
+            "(sku, artikal, kolicina_sum, nabavna_sum, prodajna_sum, marza_sum, doc_count, "
+            "first_date, last_date, import_run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            parsed,
+        )
+    return len(parsed)
+
+
+def _apply_kalkulacije_detail(conn: sqlite3.Connection, rows: list[dict[str, str]], import_run_id: int) -> int:
+    before = conn.execute("SELECT COUNT(*) FROM cartice_kalkulacije_detail").fetchone()[0]
+    parsed = []
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in rows:
+        opis = (row.get("Opis") or "").strip()
+        if not opis:
+            continue
+        parsed.append(
+            (
+                opis,
+                (row.get("SKU") or "").strip(),
+                (row.get("Artikal") or "").strip(),
+                (row.get("Datum") or "").strip(),
+                (row.get("Broj") or "").strip(),
+                _parse_float(row.get("Kolicina")) or 0.0,
+                timestamp,
+                import_run_id,
+            )
+        )
+    if parsed:
+        conn.executemany(
+            "INSERT OR IGNORE INTO cartice_kalkulacije_detail "
+            "(opis, sku, artikal, datum, broj, kolicina, imported_at, import_run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            parsed,
+        )
+    after = conn.execute("SELECT COUNT(*) FROM cartice_kalkulacije_detail").fetchone()[0]
+    return after - before
+
+
+def _apply_prodaja_stats(conn: sqlite3.Connection, rows: list[dict[str, str]], import_run_id: int) -> int:
+    conn.execute("DELETE FROM prodaja_stats")
+    parsed = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in rows:
+        sku = (row.get("SKU") or "").strip()
+        if not sku:
+            continue
+        parsed.append(
+            (
+                sku,
+                (row.get("Artikal") or "").strip(),
+                _parse_float(row.get("Total prodato")) or 0.0,
+                (row.get("Prvi datum") or "").strip(),
+                (row.get("Zadnji datum") or "").strip(),
+                _parse_int(row.get("Ukupno dana")) or 0,
+                _parse_int(row.get("Dani bez zalihe")) or 0,
+                _parse_int(row.get("Dani dostupno")) or 0,
+                _parse_float(row.get("Prosek dnevno")) or 0.0,
+                _parse_float(row.get("Ukupno neto")) or 0.0,
+                _parse_float(row.get("Prosek neto")) or 0.0,
+                _parse_float(row.get("Procjena gubitka neto")) or 0.0,
+                _parse_float(row.get("Procena izgubljeno")) or 0.0,
+                now,
+                import_run_id,
+            )
+        )
+    if parsed:
+        conn.executemany(
+            "INSERT INTO prodaja_stats "
+            "(sku, artikal, total_sold, first_date, last_date, total_days, days_without, days_available, "
+            "avg_daily, total_net, avg_net, lost_net, lost_qty, imported_at, import_run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            parsed,
+        )
+    return len(parsed)
+
+
+def _get_last_import_info(conn: sqlite3.Connection, source: str) -> tuple[str, int] | None:
+    row = conn.execute(
+        "SELECT imported_at, row_count FROM import_runs "
+        "WHERE source = ? "
+        "ORDER BY imported_at DESC LIMIT 1",
+        (source,),
+    ).fetchone()
+    if not row:
+        return None
+    return row[0], int(row[1] or 0)
 
 
 def set_app_state(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -4595,11 +5058,16 @@ def run_ui(db_path: Path) -> None:
         "prodaja_period_days": None,
         "prodaja_period_start": None,
         "prodaja_period_end": None,
+        "kalkulacije_output_dir": str(KALKULACIJE_OUT_DIR.resolve()),
+        "kartice_output_dir": str(KALKULACIJE_OUT_DIR.resolve()),
     }
+    state["kalkulacije_output_dir"] = str(
+        Path(settings.get("kalkulacije_output_dir", state["kalkulacije_output_dir"]))
+    )
+    state["kartice_output_dir"] = str(
+        Path(settings.get("kartice_output_dir", state["kartice_output_dir"]))
+    )
     btn_reset_matches = None
-    PRODAJA_CSV = Path("Kalkulacije_kartice_art/izlaz/prodaja_avg_i_gubitak.csv")
-    _prodaja_cache = {"mtime": None, "df": pd.DataFrame()}
-
     def get_conn():
         conn = connect_db(state["db_path"])
         init_db(conn)
@@ -4693,39 +5161,37 @@ def run_ui(db_path: Path) -> None:
         return None
 
     def _load_prodaja_dataframe() -> pd.DataFrame:
-        path = PRODAJA_CSV
+        conn = get_conn()
         try:
-            mtime = path.stat().st_mtime
-        except FileNotFoundError:
-            _prodaja_cache["df"] = pd.DataFrame()
-            _prodaja_cache["mtime"] = None
-            return _prodaja_cache["df"]
-        if _prodaja_cache["mtime"] == mtime and not _prodaja_cache["df"].empty:
-            return _prodaja_cache["df"]
-        try:
-            df = pd.read_csv(
-                path,
-                parse_dates=["Prvi datum", "Zadnji datum"],
-                dayfirst=False,
-                encoding="utf-8",
-            )
-        except Exception:
-            _prodaja_cache["df"] = pd.DataFrame()
-            _prodaja_cache["mtime"] = mtime
-            return _prodaja_cache["df"]
-        numeric_cols = [
-            "Total prodato",
-            "Dani bez zalihe",
-            "Prosek dnevno",
-            "Ukupno neto",
-            "Prosek neto",
-            "Procjena gubitka neto",
-        ]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        _prodaja_cache["df"] = df
-        _prodaja_cache["mtime"] = mtime
+            rows = conn.execute(
+                "SELECT sku, artikal, total_sold, first_date, last_date, total_days, "
+                "days_without, days_available, avg_daily, total_net, avg_net, lost_net, lost_qty "
+                "FROM prodaja_stats"
+            ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            rows,
+            columns=[
+                "SKU",
+                "Artikal",
+                "Total prodato",
+                "Prvi datum",
+                "Zadnji datum",
+                "Ukupno dana",
+                "Dani bez zalihe",
+                "Dani dostupno",
+                "Prosek dnevno",
+                "Ukupno neto",
+                "Prosek neto",
+                "Procjena gubitka neto",
+                "Procena izgubljeno",
+            ],
+        )
+        for col in ("Prvi datum", "Zadnji datum"):
+            df[col] = pd.to_datetime(df[col], errors="coerce")
         return df
 
     def _resolve_prodaja_period():
@@ -4749,6 +5215,197 @@ def run_ui(db_path: Path) -> None:
         if end is not None and "Prvi datum" in df.columns:
             mask &= df["Prvi datum"].dt.date <= end
         return df.loc[mask]
+
+    def update_cartice_ui():
+        parts: list[str] = []
+        conn = get_conn()
+        try:
+            for source in (ZERO_SOURCE, KALKULACIJE_SOURCE, PRODAJA_SOURCE):
+                info = _get_last_import_info(conn, source)
+                label = SOURCE_LABELS.get(source, source)
+                if info:
+                    imported_at, row_count = info
+                    parts.append(f"{label}: {imported_at} ({row_count} redova)")
+                else:
+                    parts.append(f"{label}: nema uvoza")
+        finally:
+            conn.close()
+        cartice_status_var.set(" | ".join(parts))
+
+    def _show_import_summary(title: str, summary: list[dict[str, str | int]]) -> None:
+        lines: list[str] = []
+        for result in summary:
+            label = SOURCE_LABELS.get(result["source"], result["source"])
+            status = result.get("status")
+            if status == "missing":
+                lines.append(f"{label}: fajl nije pronaden ({result.get('path')})")
+            elif status == "skipped":
+                lines.append(f"{label}: podaci vec postoje")
+            elif status == "imported":
+                rows = result.get("rows", 0)
+                lines.append(f"{label}: uvezeno {rows} redova")
+        message = "\n".join(lines) if lines else "Nema novih podataka za import."
+        messagebox.showinfo(title, message)
+
+    def _run_cartice_import_batch(
+        title: str, batch: list[tuple[Path, str, callable]]
+    ) -> list[dict[str, str | int]]:
+        if state.get("baseline_locked"):
+            messagebox.showwarning(
+                "Baza zakljucana",
+                "Trenutno stanje je zakljucano kao pocetno, resetuj bazu da bi uvezao nove podatke.",
+            )
+            return []
+        conn = get_conn()
+        summary: list[dict[str, str | int]] = []
+        try:
+            for path, source, fn in batch:
+                summary.append(_run_cartice_import(conn, path, source, fn))
+        except Exception as exc:
+            messagebox.showerror(title, f"Greska pri importu: {exc}")
+            return []
+        finally:
+            conn.close()
+        refresh_prodaja_tab()
+        update_cartice_ui()
+        _show_import_summary(title, summary)
+        return summary
+
+    def import_cartice_data():
+        _run_cartice_import_batch(
+            "Import kartice",
+            [
+                (KALKULACIJE_DETAIL_CSV, KALKULACIJE_DETAIL_SOURCE, _apply_kalkulacije_detail),
+                (ZERO_INTERVAL_CSV, ZERO_SOURCE, _apply_zero_intervals),
+                (KALKULACIJE_AGG_CSV, KALKULACIJE_SOURCE, _apply_kalkulacije),
+                (PRODAJA_STATS_CSV, PRODAJA_SOURCE, _apply_prodaja_stats),
+            ],
+        )
+
+    def _run_external_parser(label: str, cmd: list[str]) -> bool:
+        status_var.set(f"{label}: pokrećem parser...")
+        app.update_idletasks()
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            error = (exc.stderr or exc.stdout or str(exc)).strip()
+            log_app_error(label, error)
+            messagebox.showerror("Parser greška", f"{label}:\n{error}")
+            status_var.set("Greska.")
+            return False
+        except FileNotFoundError as exc:
+            log_app_error(label, str(exc))
+            messagebox.showerror("Parser greška", str(exc))
+            status_var.set("Greska.")
+            return False
+        status_var.set("Spremno.")
+        return True
+
+    def _choose_output_dir(state_key: str, var: ctk.StringVar, title: str) -> None:
+        folder = filedialog.askdirectory(
+            title=title, initialdir=state.get(state_key) or str(KALKULACIJE_OUT_DIR)
+        )
+        if not folder:
+            return
+        resolved = str(Path(folder).resolve())
+        state[state_key] = resolved
+        var.set(resolved)
+        save_app_settings({state_key: resolved})
+
+    def import_kalkulacije_flow() -> None:
+        if state.get("baseline_locked"):
+            messagebox.showwarning(
+                "Baza zakljucana",
+                "Trenutno stanje je zakljucano kao pocetno, resetuj bazu da bi uvezao nove podatke.",
+            )
+            return
+        excel_path = filedialog.askopenfilename(
+            title="Odaberi Excel kalkulaciju",
+            initialdir=str(KALKULACIJE_DIR),
+            filetypes=[("Excel fajl", "*.xlsx"), ("Svi fajlovi", "*.*")],
+        )
+        if not excel_path:
+            return
+        output_dir = Path(state["kalkulacije_output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            sys.executable,
+            str(EXTRACT_SCRIPT),
+            "--excel",
+            excel_path,
+            "--out",
+            str(output_dir),
+            "--skip-pdf",
+        ]
+        if not _run_external_parser("Kalkulacije", cmd):
+            return
+        _run_cartice_import_batch(
+            "Import kalkulacija",
+            [
+                (output_dir / "kalkulacije_marza.csv", KALKULACIJE_DETAIL_SOURCE, _apply_kalkulacije_detail),
+                (output_dir / "kalkulacije_marza_agregat.csv", KALKULACIJE_SOURCE, _apply_kalkulacije),
+                (output_dir / "prodaja_avg_i_gubitak.csv", PRODAJA_SOURCE, _apply_prodaja_stats),
+            ],
+        )
+
+    def import_kartice_flow() -> None:
+        if state.get("baseline_locked"):
+            messagebox.showwarning(
+                "Baza zakljucana",
+                "Trenutno stanje je zakljucano kao pocetno, resetuj bazu da bi uvezao nove podatke.",
+            )
+            return
+        pdf_path = filedialog.askopenfilename(
+            title="Odaberi PDF karticu artikala",
+            initialdir=str(KALKULACIJE_DIR),
+            filetypes=[("PDF fajl", "*.pdf"), ("Svi fajlovi", "*.*")],
+        )
+        if not pdf_path:
+            return
+        output_dir = Path(state["kartice_output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            sys.executable,
+            str(EXTRACT_SCRIPT),
+            "--pdf",
+            pdf_path,
+            "--out",
+            str(output_dir),
+            "--skip-excel",
+        ]
+        if not _run_external_parser("Kartice artikala", cmd):
+            return
+        _run_cartice_import_batch(
+            "Import kartice artikala",
+            [
+                (output_dir / "kartice_zero_intervali.csv", ZERO_SOURCE, _apply_zero_intervals),
+                (output_dir / "prodaja_avg_i_gubitak.csv", PRODAJA_SOURCE, _apply_prodaja_stats),
+            ],
+        )
+
+    def show_latest_kalkulacija():
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT opis, sku, artikal, datum, broj, imported_at "
+                "FROM cartice_kalkulacije_detail "
+                "ORDER BY imported_at DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            messagebox.showinfo("Najnovija kalkulacija", "Ne postoji nijedna uvezena kalkulacija.")
+            return
+        opis, sku, artikal, datum, broj, imported_at = row
+        info = (
+            f"Opis: {opis}\n"
+            f"SKU: {sku or '-'}\n"
+            f"Artikal: {artikal or '-'}\n"
+            f"Datum kalkulacije: {datum or '-'}\n"
+            f"Broj: {broj or '-'}\n"
+            f"Uvezeno: {imported_at or '-'}"
+        )
+        messagebox.showinfo("Najnovija kalkulacija", info)
 
     def get_progress_info(task: str):
         conn = get_conn()
@@ -5532,6 +6189,33 @@ def run_ui(db_path: Path) -> None:
         load_baseline_lock()
         update_baseline_ui()
 
+    def unlock_baseline_with_password():
+        typed = reset_pass_var.get().strip()
+        if not typed:
+            messagebox.showerror("Greska", "Unesi lozinku za reset.")
+            return
+        conn = get_conn()
+        try:
+            stored_hash = get_app_state(conn, "reset_password_hash")
+        finally:
+            conn.close()
+        if not stored_hash:
+            messagebox.showerror("Greska", "Lozinka za reset nije postavljena.")
+            return
+        if hash_password(typed) != stored_hash:
+            messagebox.showerror("Greska", "Pogresna lozinka.")
+            return
+        conn = get_conn()
+        try:
+            set_app_state(conn, "baseline_locked", "0")
+            set_app_state(conn, "baseline_locked_at", "")
+        finally:
+            conn.close()
+        load_baseline_lock()
+        update_baseline_ui()
+        messagebox.showinfo("OK", "Baza je otkljucana za uvoz dokumenata.")
+        update_cartice_ui()
+
     def set_reset_password():
         value = reset_pass_var.get().strip()
         if not value:
@@ -5582,6 +6266,32 @@ def run_ui(db_path: Path) -> None:
         update_baseline_ui()
         refresh_dashboard()
         messagebox.showinfo("OK", f"Reset zavrsen. Backup: {backup_path}")
+
+    def run_backup_only():
+        typed = reset_pass_var.get().strip()
+        if not typed:
+            messagebox.showerror("Greska", "Unesi lozinku za reset.")
+            return
+        conn = get_conn()
+        try:
+            stored_hash = get_app_state(conn, "reset_password_hash")
+        finally:
+            conn.close()
+        if not stored_hash:
+            messagebox.showerror("Greska", "Lozinka za reset nije postavljena.")
+            return
+        if hash_password(typed) != stored_hash:
+            messagebox.showerror("Greska", "Pogresna lozinka.")
+            return
+        backup_path = state["db_path"].with_suffix(
+            f".bak-only-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+        try:
+            shutil.copy2(state["db_path"], backup_path)
+        except Exception as exc:
+            messagebox.showerror("Greska", f"Backup neuspjesan: {exc}")
+            return
+        messagebox.showinfo("OK", f"Backup spreman: {backup_path}")
 
     def run_export_bank_refunds():
         conn = get_conn()
@@ -6591,6 +7301,17 @@ def run_ui(db_path: Path) -> None:
     lbl_baseline.pack(side="left", padx=4)
     btn_lock_baseline = ctk.CTkButton(security_row, text="Zakljucaj pocetno stanje", command=set_baseline_lock)
     btn_lock_baseline.pack(side="left", padx=6)
+    btn_unlock_baseline = ctk.CTkButton(
+        security_row,
+        text="Otkljucaj lozinkom",
+        command=unlock_baseline_with_password,
+    )
+    btn_unlock_baseline.pack(side="left", padx=6)
+    ctk.CTkButton(
+        security_row,
+        text="Backup baze",
+        command=run_backup_only,
+    ).pack(side="left", padx=6)
 
     reset_row = ctk.CTkFrame(settings_body)
     reset_row.pack(fill="x", padx=6, pady=(0, 10))
@@ -6606,6 +7327,14 @@ def run_ui(db_path: Path) -> None:
     audit_row.pack(fill="x", padx=6, pady=(0, 10))
     ctk.CTkButton(audit_row, text="Export audit.xlsx", command=run_export_audit).pack(side="left", padx=6)
 
+    ctk.CTkLabel(settings_body, text="Kartice").pack(anchor="w", padx=6, pady=(6, 4))
+    cartice_row = ctk.CTkFrame(settings_body)
+    cartice_row.pack(fill="x", padx=6, pady=(0, 10))
+    cartice_status_var = ctk.StringVar(value="Kartice: nema uvoza")
+    ctk.CTkLabel(cartice_row, textvariable=cartice_status_var).pack(side="left", padx=(6, 4))
+    ctk.CTkButton(cartice_row, text="Uvezi kartice", command=import_cartice_data).pack(side="left", padx=4)
+    ctk.CTkButton(cartice_row, text="Provjeri zadnje", command=show_latest_kalkulacija).pack(side="left", padx=4)
+
     def update_baseline_ui():
         locked = state.get("baseline_locked", False)
         locked_at = state.get("baseline_locked_at")
@@ -6615,9 +7344,11 @@ def run_ui(db_path: Path) -> None:
                 text += f" ({locked_at})"
             baseline_status_var.set(text)
             btn_lock_baseline.configure(state="disabled")
+            btn_unlock_baseline.configure(state="normal")
         else:
             baseline_status_var.set("Otkljucano")
             btn_lock_baseline.configure(state="normal")
+            btn_unlock_baseline.configure(state="disabled")
         if btn_reset_matches is not None:
             btn_reset_matches.configure(state="disabled" if locked else "normal")
 
@@ -6671,6 +7402,7 @@ def run_ui(db_path: Path) -> None:
 
     load_baseline_lock()
     update_baseline_ui()
+    update_cartice_ui()
     app.after(1000, poll_global_status)
 
     refresh_exchange_rate()
@@ -6949,6 +7681,8 @@ def run_ui(db_path: Path) -> None:
 
     uvoz_frame = ctk.CTkFrame(ops_frame)
     uvoz_frame.pack(anchor="nw", fill="x", pady=(0, 10))
+    kalkulacije_dir_var = ctk.StringVar(value=state["kalkulacije_output_dir"])
+    kartice_dir_var = ctk.StringVar(value=state["kartice_output_dir"])
     ctk.CTkLabel(uvoz_frame, text="Uvoz novih fajlova").pack(anchor="w", pady=(0, 2))
     ctk.CTkLabel(
         uvoz_frame,
@@ -6968,6 +7702,52 @@ def run_ui(db_path: Path) -> None:
     ctk.CTkButton(uvoz_frame, text="SP Uplate", command=lambda: run_import_folder(import_sp_payments, "SP Uplate (folder)", "*.xlsx")).pack(anchor="w", pady=2)
     ctk.CTkButton(uvoz_frame, text="Banka XML", command=lambda: run_import_folder(import_bank_xml, "Banka XML (folder)", "*.xml")).pack(anchor="w", pady=2)
     ctk.CTkButton(uvoz_frame, text="SP Preuzimanja", command=lambda: run_import_folder(import_sp_returns, "SP Preuzimanja (folder)", "*.xlsx")).pack(anchor="w", pady=2)
+    ctk.CTkFrame(uvoz_frame, height=1, fg_color="#7a7a7a").pack(fill="x", pady=(8, 6))
+    ctk.CTkLabel(uvoz_frame, text="Kalkulacije i kartice artikala").pack(anchor="w", pady=(0, 4))
+    kalkulacije_frame = ctk.CTkFrame(uvoz_frame)
+    kalkulacije_frame.pack(fill="x", pady=(0, 4))
+    ctk.CTkButton(
+        kalkulacije_frame,
+        text="Uvezi nove kalkulacije",
+        command=import_kalkulacije_flow,
+    ).pack(side="left")
+    ctk.CTkEntry(
+        kalkulacije_frame,
+        textvariable=kalkulacije_dir_var,
+        placeholder_text="Folder za CSV fajlove kalkulacija",
+    ).pack(side="left", fill="x", expand=True, padx=(6, 2))
+    ctk.CTkButton(
+        kalkulacije_frame,
+        text="Folder",
+        width=90,
+        command=lambda: _choose_output_dir(
+            "kalkulacije_output_dir",
+            kalkulacije_dir_var,
+            "Folder za kalkulacije CSV",
+        ),
+    ).pack(side="left")
+    kartice_frame = ctk.CTkFrame(uvoz_frame)
+    kartice_frame.pack(fill="x", pady=(0, 4))
+    ctk.CTkButton(
+        kartice_frame,
+        text="Uvezi kartice artikala",
+        command=import_kartice_flow,
+    ).pack(side="left")
+    ctk.CTkEntry(
+        kartice_frame,
+        textvariable=kartice_dir_var,
+        placeholder_text="Folder za CSV fajlove kartica",
+    ).pack(side="left", fill="x", expand=True, padx=(6, 2))
+    ctk.CTkButton(
+        kartice_frame,
+        text="Folder",
+        width=90,
+        command=lambda: _choose_output_dir(
+            "kartice_output_dir",
+            kartice_dir_var,
+            "Folder za kartice CSV",
+        ),
+    ).pack(side="left")
 
     akcije_frame = ctk.CTkFrame(ops_frame)
     akcije_frame.pack(anchor="nw", fill="x")
