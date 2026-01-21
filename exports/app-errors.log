@@ -1,0 +1,32 @@
+[2026-01-19 17:58:14] Kalkulacije: Traceback (most recent call last):
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 521, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 499, in main
+    zero_path = _latest_csv_path(args.out, ZERO_INTERVAL_BASE)
+                ^^^^^^^^^^^^^^^^
+NameError: name '_latest_csv_path' is not defined
+[2026-01-19 17:58:30] Kalkulacije: Traceback (most recent call last):
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 521, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 499, in main
+    zero_path = _latest_csv_path(args.out, ZERO_INTERVAL_BASE)
+                ^^^^^^^^^^^^^^^^
+NameError: name '_latest_csv_path' is not defined
+[2026-01-19 17:58:45] Kalkulacije: Traceback (most recent call last):
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 521, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 499, in main
+    zero_path = _latest_csv_path(args.out, ZERO_INTERVAL_BASE)
+                ^^^^^^^^^^^^^^^^
+NameError: name '_latest_csv_path' is not defined
+[2026-01-19 18:03:30] Kalkulacije: Traceback (most recent call last):
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 521, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "c:\Users\HOME\Desktop\Srbija1.0 aplikacija\extract_kalkulacije_kartice.py", line 499, in main
+    zero_path = _latest_csv_path(args.out, ZERO_INTERVAL_BASE)
+                ^^^^^^^^^^^^^^^^
+NameError: name '_latest_csv_path' is not defined
